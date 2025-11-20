@@ -268,7 +268,7 @@ if uploaded:
     pred_ext = "Watermark Present"   # fixed label
     conf_ext = np.random.uniform(0.70, 0.80)   # static random confidence
 
-    st.write(f"Detection (external): **{pred_ext}** — Confidence: **{conf_ext:.3f}**")
+    # st.write(f"Detection (external): **{pred_ext}** — Confidence: **{conf_ext:.3f}**")
 
 
     # classical attacks: produce one attacked image (blur->jpeg->noise)
@@ -299,7 +299,7 @@ if uploaded:
     # STATIC detection (no model)
         pred_ext = "Watermark Present"
         conf_ext = np.random.uniform(0.70, 0.80)
-        st.write(f"Detection (external): **{pred_ext}** — Confidence: **{conf_ext:.3f}**")
+        # st.write(f"Detection (external): **{pred_ext}** — Confidence: **{conf_ext:.3f}**")
 
     # heatmap logic...
 
@@ -366,20 +366,24 @@ if uploaded:
     # side-by-side compare images
     st.subheader("Compare — Original / Watermarked / Attacked / GAN")
     cols2 = st.columns(4)
-    cols2[0].image(orig_np, caption="Original")
-    cols2[1].image(wm, caption=f"Watermarked\n({predict_image(wm)[0]} {predict_image(wm)[1]:.2f})")
 
-    # show active attacked image: prefer session_state.attacked_img (external/classical), else show the classical 'attacked' local var
+    cols2[0].image(orig_np, caption="Original")
+    cols2[1].image(wm, caption="Watermarked")
+
+# Active attacked image (external or classical)
     active_att = None
     if "attacked_img" in st.session_state and st.session_state.attacked_img is not None:
         active_att = st.session_state.attacked_img
     else:
-        active_att = attacked  # local classical attack
+        active_att = attacked  # fallback
 
-    cols2[2].image(active_att, caption=f"Attacked\n({predict_image(active_att)[0]} {predict_image(active_att)[1]:.2f})")
-    cols2[3].image(st.session_state.gan_img if ("gan_img" in st.session_state and st.session_state.gan_img is not None) else np.zeros_like(orig_np),
-                   caption=f"GAN-approx\n({predict_image(st.session_state.gan_img)[0] if ('gan_img' in st.session_state and st.session_state.gan_img is not None) else '—'})")
+    cols2[2].image(active_att, caption="Attacked")
 
+# GAN image (if exists)
+    if "gan_img" in st.session_state and st.session_state.gan_img is not None:
+        cols2[3].image(st.session_state.gan_img, caption="GAN-approx")
+    else:
+        cols2[3].image(np.zeros_like(orig_np), caption="GAN-approx")
     # downloads
     st.subheader("Download Images")
     st.download_button("Download watermarked (PNG)", data=np_to_image_bytes(wm), file_name="watermarked.png", mime="image/png")
