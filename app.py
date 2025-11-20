@@ -320,7 +320,6 @@ if uploaded:
         st.subheader("Classical Attack (Blur + JPEG + Noise)")
         st.image(attacked)
         pred_att, conf_att = predict_image(attacked)
-        st.write(f"Detection (attacked): **{pred_att}** — Confidence: **{conf_att:.3f}")
 
     # ---- GAN ATTACK ----
     gan_img = None
@@ -336,7 +335,6 @@ if uploaded:
         st.subheader("GAN-Approx Regenerated Image")
         st.image(gan_img)
         pred_gan, conf_gan = predict_image(gan_img)
-        st.write(f"Detection (GAN-approx): **{pred_gan}** — Confidence: **{conf_gan:.3f}**")
 
     # =============================
     # CONFIDENCE BAR CHART (STATIC)
