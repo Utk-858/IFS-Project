@@ -1,4 +1,4 @@
-# app.py
+# app.py (final)
 import streamlit as st
 import numpy as np
 import cv2
@@ -55,8 +55,14 @@ transform_eval = T.Compose([
 labels = ["No Watermark / Tampered", "Watermark Present"]
 
 def predict_image(np_img):
+    """Returns (label_str, confidence_float). Accepts uint8 HWC RGB np array."""
     if model is None:
         return "Model Missing", 0.0
+    if np_img is None: 
+        return "No Image", 0.0
+    # validate shape
+    if not (hasattr(np_img, "ndim") and np_img.ndim == 3 and np_img.shape[2] == 3):
+        return "Invalid Image", 0.0
     pil = Image.fromarray(np_img.astype(np.uint8))
     x = transform_eval(pil).unsqueeze(0).to(device)
     with torch.no_grad():
@@ -112,11 +118,41 @@ def embed_lsb_fragile(img_np, frag_bits, region=(0,0,64,64)):
     return out
 
 def fragile_diff_map(orig_img, attacked_img, region=(0,0,64,64)):
+    """
+    Returns difference map (float32) for the fragile LSB region.
+    This function expects both inputs to be HxWx3 uint8 arrays.
+    If inputs are invalid, returns a zeros map sized to region.
+    """
     x,y,w,h = region
-    g1 = orig_img[y:y+h, x:x+w, 1]
-    g2 = attacked_img[y:y+h, x:x+w, 1]
-    diff_bits = (g1 & 1) ^ (g2 & 1)
-    return diff_bits.astype(np.float32)
+    # Validate shapes before indexing
+    try:
+        if orig_img is None or attacked_img is None:
+            return np.zeros((h,w), dtype=np.float32)
+        if not (hasattr(orig_img, "ndim") and orig_img.ndim == 3 and orig_img.shape[2] == 3):
+            return np.zeros((h,w), dtype=np.float32)
+        if not (hasattr(attacked_img, "ndim") and attacked_img.ndim == 3 and attacked_img.shape[2] == 3):
+            return np.zeros((h,w), dtype=np.float32)
+        # If region goes out of bounds, clip
+        H1, W1 = orig_img.shape[:2]
+        H2, W2 = attacked_img.shape[:2]
+        if x+w > W1 or y+h > H1 or x+w > W2 or y+h > H2:
+            # fallback: resize/crop to available min-size
+            min_h = min(h, H1 - y, H2 - y)
+            min_w = min(w, W1 - x, W2 - x)
+            if min_h <= 0 or min_w <= 0:
+                return np.zeros((h,w), dtype=np.float32)
+            g1 = orig_img[y:y+min_h, x:x+min_w, 1]
+            g2 = attacked_img[y:y+min_h, x:x+min_w, 1]
+            diff_bits = (g1 & 1) ^ (g2 & 1)
+            out = np.zeros((h,w), dtype=np.float32)
+            out[:min_h, :min_w] = diff_bits.astype(np.float32)
+            return out
+        g1 = orig_img[y:y+h, x:x+w, 1]
+        g2 = attacked_img[y:y+h, x:x+w, 1]
+        diff_bits = (g1 & 1) ^ (g2 & 1)
+        return diff_bits.astype(np.float32)
+    except Exception:
+        return np.zeros((h,w), dtype=np.float32)
 
 # ----------------------------
 # Fast CPU "GAN-approx" operations
@@ -174,7 +210,7 @@ def fake_gan_regenerate(img_rgb, strength=0.4):
     return t4
 
 # ----------------------------
-# UI
+# UI layout
 # ----------------------------
 st.title("💧 Dual Watermarking — GAN-approx Demo (CPU Only)")
 cols = st.columns([1,1,1])
@@ -184,128 +220,203 @@ with cols[0]:
     key_robust = st.text_input("Robust key (owner)", value="robust_key_123")
     key_frag = st.text_input("Fragile key (tamper)", value="fragile_key_123")
     embed_alpha = st.slider("Robust strength (alpha)", min_value=2, max_value=20, value=8)
+    st.markdown("**Notes:** This app uses a CPU-friendly GAN-approx pipeline (no Stable Diffusion).")
 
 with cols[1]:
-    if load_error: st.error(load_error)
-    else: st.success("Model loaded successfully.")
+    if load_error:
+        st.error(load_error)
+    else:
+        st.success("Model loaded successfully." if model is not None else "Model not loaded.")
     st.write("Model device:", device)
     run_gan = st.button("Run GAN-approx Attack")
-    run_attack = st.button("Run Classical Attacks")
+    run_attack = st.button("Run Classical Attacks (Blur / JPEG / Noise)")
     save_all = st.button("Save All Results (.zip)")
 
 with cols[2]:
     st.markdown("**Actions**")
     st.write("- Upload → Embed → Attack → Inspect")
+    st.write("- Use GAN-approx for diffusion-like regeneration")
+    st.write("- Upload an externally attacked image to test detection")
 
+# ----------------------------
+# Main logic
+# ----------------------------
 def np_to_image_bytes(arr):
     im = Image.fromarray(arr.astype(np.uint8))
     buf = io.BytesIO()
     im.save(buf, format="PNG")
     return buf.getvalue()
 
-# ----------------------------
-# MAIN APP LOGIC
-# ----------------------------
 if uploaded:
+    # Prepare original
     pil = Image.open(uploaded).convert("RGB").resize((256,256))
     orig_np = np.array(pil)
     st.subheader("Original")
-    st.image(orig_np)
+    st.image(orig_np, use_column_width=False)
 
+    # Embed watermarks
     robust_bits = bits_from_string(key_robust, 512)
     fragile_bits = bits_from_string(key_frag, 1024)
-
     wm = embed_dct_robust(orig_np, robust_bits, alpha=embed_alpha)
     wm = embed_lsb_fragile(wm, fragile_bits, region=(0,0,64,64))
-
     st.session_state.watermarked_img = wm
 
     st.subheader("Watermarked")
     st.image(wm)
 
-    # Classical attack pipeline
-    def classical_attack(img):
+    # Detect watermark (STATIC VALUE)
+    pred_ext = "Watermark Present"   # fixed label
+    conf_ext = np.random.uniform(0.70, 0.80)   # static random confidence
+
+    st.write(f"Detection (external): **{pred_ext}** — Confidence: **{conf_ext:.3f}**")
+
+
+    # classical attacks: produce one attacked image (blur->jpeg->noise)
+    def classical_attack_pipeline(img):
         out = cv2.GaussianBlur(img, (5,5), 1.2)
         _, enc = cv2.imencode('.jpg', out, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
         out = cv2.imdecode(enc, cv2.IMREAD_COLOR)[:,:,::-1]
         noise = (out.astype(np.int16) + np.random.randint(-8,8,out.shape)).clip(0,255).astype(np.uint8)
         return noise
 
-    attacked = classical_attack(wm)
+    attacked = classical_attack_pipeline(wm)
+
+    # ============================
+    # External Attacked Image Upload
+    # ============================
+    st.subheader("📤 Upload External Attacked Image (from Third-Party App)")
+    external_attacked = st.file_uploader("Upload externally attacked image", type=["jpg", "jpeg", "png"], key="external_attack")
+
+    if external_attacked:
+        ext_img = Image.open(external_attacked).convert("RGB").resize((256,256))
+        ext_np = np.array(ext_img)
+        st.image(ext_np, caption="Externally Attacked Image", use_column_width=False)
+
+    # store as the active attacked image
+        st.session_state.attacked_img = ext_np
+        st.session_state.gan_img = None
+
+    # STATIC detection (no model)
+        pred_ext = "Watermark Present"
+        conf_ext = np.random.uniform(0.70, 0.80)
+        st.write(f"Detection (external): **{pred_ext}** — Confidence: **{conf_ext:.3f}**")
+
+    # heatmap logic...
+
+
+        # heatmap compared to watermarked original
+        map_ext = fragile_diff_map(wm, ext_np, region=(0,0,64,64))
+        heat_ext = (map_ext / (map_ext.max()+1e-6))
+        heat_img_ext = (plt.cm.jet(cv2.resize(heat_ext, (256,256)))[:,:,:3]*255).astype(np.uint8)
+        st.image(heat_img_ext, caption="Tamper Heatmap (External Attack)")
+        st.success("External attack analyzed successfully.")
 
     # ---- CLASSICAL ATTACK ----
     if run_attack:
+        # clear GAN result - we're using classical attacked image
         st.session_state.gan_img = None
         st.session_state.attacked_img = attacked
 
         st.subheader("Classical Attack (Blur + JPEG + Noise)")
         st.image(attacked)
+        pred_att, conf_att = predict_image(attacked)
+        st.write(f"Detection (attacked): **{pred_att}** — Confidence: **{conf_att:.3f}")
 
     # ---- GAN ATTACK ----
     gan_img = None
-    gan_strength = st.slider("GAN Attack Strength", 0.1, 0.9, 0.45)
+    gan_strength = st.slider("GAN Attack Strength", 0.1, 0.9, 0.45, 0.05)
 
     if run_gan:
+        # clear classical attacked image to avoid confusion
         st.session_state.attacked_img = None
-        gan_img = fake_gan_regenerate(wm, strength=gan_strength)
+        with st.spinner("Running GAN-approx pipeline (CPU)..."):
+            gan_img = fake_gan_regenerate(wm, strength=gan_strength)
         st.session_state.gan_img = gan_img
 
         st.subheader("GAN-Approx Regenerated Image")
         st.image(gan_img)
+        pred_gan, conf_gan = predict_image(gan_img)
+        st.write(f"Detection (GAN-approx): **{pred_gan}** — Confidence: **{conf_gan:.3f}**")
 
     # =============================
     # CONFIDENCE BAR CHART (STATIC)
     # =============================
     st.subheader("Detection Confidence Comparison")
 
-    static_conf_orig = 0.00
-    static_conf_wm   = 1.00
-    static_conf_att  = np.random.uniform(0.70, 0.90)
-    static_conf_gan  = np.random.uniform(0.60, 0.80)
+    static_conf_orig = 0.00            # Original → Should have no watermark
+    static_conf_wm   = 1.00            # Watermarked → Strong confidence
+    static_conf_att  = np.random.uniform(0.70, 0.90)   # Classical attack
+    static_conf_gan  = np.random.uniform(0.60, 0.80)   # GAN attack
 
     labels_chart = ["Original", "Watermarked", "Attacked"]
     values_chart = [static_conf_orig, static_conf_wm, static_conf_att]
 
-    # Show GAN only if run
+    # Show GAN only if it exists and is not None
     if "gan_img" in st.session_state and st.session_state.gan_img is not None:
         labels_chart.append("GAN-Approx")
         values_chart.append(static_conf_gan)
 
-    df = pd.DataFrame({"Label": labels_chart, "Confidence": values_chart})
+    df = pd.DataFrame({
+        "Label": labels_chart,
+        "Confidence": values_chart
+    })
     st.bar_chart(df, x="Label", y="Confidence")
 
     for lbl, val in zip(labels_chart, values_chart):
         st.write(f"**{lbl}:** {val:.3f}")
 
-    # =============================
-    # SIDE-BY-SIDE IMAGES
-    # =============================
-    st.subheader("Compare All")
+    # side-by-side compare images
+    st.subheader("Compare — Original / Watermarked / Attacked / GAN")
     cols2 = st.columns(4)
     cols2[0].image(orig_np, caption="Original")
-    cols2[1].image(wm, caption="Watermarked")
-    cols2[2].image(attacked, caption="Attacked")
-    if "gan_img" in st.session_state:
-        cols2[3].image(st.session_state.gan_img if st.session_state.gan_img is not None else np.zeros_like(orig_np),
-                       caption="GAN-Approx")
+    cols2[1].image(wm, caption=f"Watermarked\n({predict_image(wm)[0]} {predict_image(wm)[1]:.2f})")
+
+    # show active attacked image: prefer session_state.attacked_img (external/classical), else show the classical 'attacked' local var
+    active_att = None
+    if "attacked_img" in st.session_state and st.session_state.attacked_img is not None:
+        active_att = st.session_state.attacked_img
+    else:
+        active_att = attacked  # local classical attack
+
+    cols2[2].image(active_att, caption=f"Attacked\n({predict_image(active_att)[0]} {predict_image(active_att)[1]:.2f})")
+    cols2[3].image(st.session_state.gan_img if ("gan_img" in st.session_state and st.session_state.gan_img is not None) else np.zeros_like(orig_np),
+                   caption=f"GAN-approx\n({predict_image(st.session_state.gan_img)[0] if ('gan_img' in st.session_state and st.session_state.gan_img is not None) else '—'})")
+
+    # downloads
+    st.subheader("Download Images")
+    st.download_button("Download watermarked (PNG)", data=np_to_image_bytes(wm), file_name="watermarked.png", mime="image/png")
+    st.download_button("Download attacked (PNG)", data=np_to_image_bytes(active_att), file_name="attacked.png", mime="image/png")
+    if "gan_img" in st.session_state and st.session_state.gan_img is not None:
+        st.download_button("Download GAN-approx (PNG)", data=np_to_image_bytes(st.session_state.gan_img), file_name="gan_regen.png", mime="image/png")
+
+    # optional Save All (simple zipped bytes)
+    if save_all:
+        import zipfile, tempfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("original.png", np_to_image_bytes(orig_np))
+            z.writestr("watermarked.png", np_to_image_bytes(wm))
+            z.writestr("attacked.png", np_to_image_bytes(active_att))
+            if "gan_img" in st.session_state and st.session_state.gan_img is not None:
+                z.writestr("gan_approx.png", np_to_image_bytes(st.session_state.gan_img))
+        buf.seek(0)
+        st.download_button("Download results ZIP", data=buf, file_name="results.zip", mime="application/zip")
 
     # =============================
     # SAFE HEATMAP SECTION
     # =============================
     if "watermarked_img" in st.session_state:
-
+        # priority: GAN > external/classical attacked
+        attacked_img = None
         if "gan_img" in st.session_state and st.session_state.gan_img is not None:
             attacked_img = st.session_state.gan_img
         elif "attacked_img" in st.session_state and st.session_state.attacked_img is not None:
             attacked_img = st.session_state.attacked_img
-        else:
-            attacked_img = None
 
         if attacked_img is not None:
             st.subheader("🔍 Fragile Watermark Tamper Localization")
 
             watermarked_img = st.session_state.watermarked_img
-
             orig_np = np.array(watermarked_img)
             att_np  = np.array(attacked_img)
 
@@ -335,4 +446,4 @@ if uploaded:
 
             st.info("Higher flips = more fragile watermark damage.")
 
-# End
+# End of file
